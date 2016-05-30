@@ -1,4 +1,4 @@
-package mozilla.org.remotedecoder;
+package org.mozilla.remotedecoder;
 
 import org.junit.Test;
 

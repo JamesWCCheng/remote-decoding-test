@@ -1,4 +1,4 @@
-package mozilla.org.remotedecoder;
+package org.mozilla.remotedecoder;
 
 import android.app.Application;
 import android.test.ApplicationTestCase;
