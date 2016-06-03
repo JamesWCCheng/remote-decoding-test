@@ -4,26 +4,21 @@
 
 package org.mozilla.remotedecoder;
 
-import android.content.ComponentName;
-import android.content.Context;
-import android.content.Intent;
-import android.content.ServiceConnection;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.Message;
-import android.os.RemoteException;
 import android.support.v7.app.AppCompatActivity;
+import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
-import org.mozilla.gecko.media.FormatParam;
-import org.mozilla.gecko.media.ICodec;
-import org.mozilla.gecko.media.ICodecCallbacks;
-import org.mozilla.gecko.media.IMediaService;
-import org.mozilla.gecko.media.MediaService;
+import org.mozilla.gecko.GeckoAppShell;
+import org.mozilla.gecko.media.CodecProxy;
 import org.mozilla.gecko.media.Sample;
 
 import java.io.IOException;
@@ -36,9 +31,7 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
 
     private SurfaceHolder mHolder;
 
-    private IMediaService mDecoderManager;
-    private boolean mIsBound;
-    private ICodec mDecoder;
+    private CodecProxy mDecoder;
     private IBinder.DeathRecipient mDecoderDeathWatcher = new IBinder.DeathRecipient() {
         @Override
         public void binderDied() {
@@ -53,7 +46,10 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
     private static final int MSG_INPUT = 1;
     private static final int MSG_OUTPUT = 2;
 
-    private final Handler mWorker = new Handler() {
+    private CodecWorker mWorker;
+
+    class CodecWorker extends Handler {
+        public CodecWorker(Looper looper) { super(looper); }
         @Override
         public void handleMessage(Message msg) {
             switch (msg.what) {
@@ -70,44 +66,43 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
         }
     };
 
-    private final ICodecCallbacks mCallbacks = new ICodecCallbacks.Stub() {
+    private final CodecProxy.Callbacks mCallbacks = new CodecProxy.Callbacks() {
         @Override
-        public void onInputConsumed() throws RemoteException {
+        public void onInputConsumed() {
             mWorker.sendEmptyMessage(MSG_INPUT);
         }
 
         @Override
-        public void onOutputFormatChanged(FormatParam format) throws RemoteException {
+        public void onOutputFormatChanged(MediaFormat format) {
             // TODO
         }
 
         @Override
-        public void onOutput(Sample sample) throws RemoteException {
+        public void onOutput(Sample sample) {
             mWorker.sendEmptyMessage(MSG_OUTPUT);
         }
 
         @Override
-        public void onError(int error) throws RemoteException {
-            // TODO
-        }
-    };
-
-    private ServiceConnection mConnection = new ServiceConnection() {
-        @Override
-        public void onServiceConnected(ComponentName name, IBinder service) {
-            mDecoderManager = IMediaService.Stub.asInterface(service);
-            startDecoding();
-        }
-
-        @Override
-        public void onServiceDisconnected(ComponentName name) {
-            stopDecoding();
-            mDecoderManager = null;
+        public void onError(CodecProxy.Error error) {
+            switch (error) {
+                case OK:
+                    break;
+                case RELEASED:
+                case REMOTE_DEAD:
+                case REMOTE_CODEC_NOT_READY:
+                case REMOTE_INPUT:
+                case REMOTE_UNKNOWN:
+                    mWorker.removeCallbacksAndMessages(null);
+                    stopDecoding();
+                    break;
+            }
         }
     };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // Init mock app shell.
+        GeckoAppShell.setAppContext(getApplicationContext());
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         SurfaceView view = (SurfaceView) findViewById(R.id.videoFrameView);
@@ -121,23 +116,26 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        if (!mIsBound) {
-            bindService(new Intent(this, MediaService.class), mConnection, Context.BIND_AUTO_CREATE);
-            mIsBound = true;
+        if (mWorker == null) {
+            HandlerThread thread = new HandlerThread("codec-driver");
+            thread.start();
+            mWorker = new CodecWorker(thread.getLooper());
         }
+
+        mWorker.post(new Runnable() {
+            public void run() {
+                startDecoding();
+            }
+        });
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
-        if (mIsBound) {
-            if (mExtractor != null) {
-                mExtractor.release();
-                mExtractor = null;
+        mWorker.post(new Runnable() {
+            public void run() {
+                stopDecoding();
             }
-
-            unbindService(mConnection);
-            mIsBound = false;
-        }
+        });
     }
 
     private void startDecoding() {
@@ -166,49 +164,31 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
             mInputFrameCount = 0;
             mOutputFrameCount = 0;
             if (mDecoder == null) {
-                try {
-                    mDecoder = mDecoderManager.createCodec();
-                    mDecoder.asBinder().linkToDeath(mDecoderDeathWatcher, 0);
-                    mDecoder.setCallbacks(mCallbacks);
-                    if (!mDecoder.configure(new FormatParam(mFormat), mHolder.getSurface(), 0)) {
-                        android.util.Log.e(LOG_TAG, "FAIL: codec not created.");
-                        mDecoder.asBinder().unlinkToDeath(mDecoderDeathWatcher, 0);
-                       mDecoder = null;
-                    } else {
-                        mDecoder.start();
-                    }
-                } catch (RemoteException e) {
-                    e.printStackTrace();
-                }
+                mDecoder = CodecProxy.create(mFormat, mHolder.getSurface(), mCallbacks);
             }
             mWorker.sendEmptyMessage(MSG_INPUT);
         }
     }
 
     private void stopDecoding() {
-        if (mDecoder == null) {
-            return;
-        }
-
-        try {
-            mDecoder.stop();
+        if (mDecoder != null) {
             mDecoder.release();
-        } catch (RemoteException e) {
-            e.printStackTrace();
+            mDecoder = null;
         }
-        mDecoder.asBinder().unlinkToDeath(mDecoderDeathWatcher, 0);
-        mDecoder = null;
+        if (mExtractor != null) {
+            mExtractor.release();
+            mExtractor = null;
+        }
     }
 
     private boolean sendFrame(Sample sample) {
-        try {
-            mDecoder.inputSample(sample);
+        if (mDecoder.input(sample) == CodecProxy.Error.OK) {
             mInputFrameCount++;
             return true;
-        } catch (RemoteException e) {
-            e.printStackTrace();
-            return false;
+        } else {
+            Log.d(LOG_TAG, "send frame error");
         }
+        return false;
     }
 
     private boolean doFrame() {

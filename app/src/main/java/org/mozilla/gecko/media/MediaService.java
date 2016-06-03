@@ -44,15 +44,15 @@ public final class MediaService extends Service {
 
     private static MediaCodecList sCodecList = new MediaCodecList(MediaCodecList.ALL_CODECS);
 
-    private static final class Codec extends ICodec.Stub  implements IBinder.DeathRecipient {
+    /* package */ static final class Codec extends ICodec.Stub  implements IBinder.DeathRecipient {
         private static final int CODEC_MSG_CONFIG = 1;
         private static final int CODEC_MSG_INPUT_SAMPLE = 2;
         private static final int CODEC_MSG_INPUT_BUFFER_AVAILABLE = 3;
         private static final int CODEC_MSG_REPORT_FORMAT_CHANGE = 4;
 
-        private static final int ERROR_CODEC_NOT_READY = -1;
-        private static final int ERROR_INPUT = -2;
-        private static final int ERROR_UNKNOWN = -3;
+        /* package */ static final int ERROR_CODEC_NOT_READY = -1;
+        /* package */ static final int ERROR_INPUT = -2;
+        /* package */ static final int ERROR_UNKNOWN = -3;
 
         final class Config {
             final MediaFormat format;
@@ -158,6 +158,7 @@ public final class MediaService extends Service {
         // IBinder.DeathRecipient
         @Override
         public void binderDied() {
+            Log.e(LOG_TAG, "Callbacks is dead");
             deinitWorker(true /* now */);
             mCallbacks = null;
         }
@@ -234,6 +235,9 @@ public final class MediaService extends Service {
                 mWorker.post(new Runnable() {
                     public void run() { mImpl.release(); }
                 });
+            }
+            if (mCallbacks != null) {
+                mCallbacks.asBinder().unlinkToDeath(this, 0);
             }
         }
 
