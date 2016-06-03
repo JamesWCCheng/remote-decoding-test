@@ -61,9 +61,7 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
                     mOutputFrameCount++;
                     break;
                 case MSG_INPUT:
-                    if (doFrame()) {
-                        sendEmptyMessage(MSG_INPUT);
-                    }
+                    doFrame();
                     break;
                 default:
                     super.handleMessage(msg);
