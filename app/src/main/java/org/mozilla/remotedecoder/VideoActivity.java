@@ -4,18 +4,20 @@
 
 package org.mozilla.remotedecoder;
 
+import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.Drawable;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.IBinder;
 import android.os.Looper;
 import android.os.Message;
 import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.View;
 
 import org.mozilla.gecko.GeckoAppShell;
 import org.mozilla.gecko.media.CodecProxy;
@@ -27,24 +29,24 @@ import java.nio.ByteBuffer;
 public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Callback {
     private static final String LOG_TAG = VideoActivity.class.getSimpleName();
 
+    private View mFrameView;
+    private Drawable mFrameDrawable;
+    private Drawable mFrameDrawableDeath;
     private static final String VIDEO_URL = "http://people.mozilla.org/~jolin/mozilla%20employee%20recruiting%20video%20.mp4";
 
     private SurfaceHolder mHolder;
 
+    private MediaExtractor mExtractor;
     private CodecProxy mDecoder;
-    private IBinder.DeathRecipient mDecoderDeathWatcher = new IBinder.DeathRecipient() {
-        @Override
-        public void binderDied() {
-            stopDecoding();
-        }
-    };
-    private MediaExtractor mExtractor; // TODO: Racy
+
     private MediaFormat mFormat;
     private int mInputFrameCount;
     private int mOutputFrameCount;
+    private long mOutputFrameUs;
 
     private static final int MSG_INPUT = 1;
     private static final int MSG_OUTPUT = 2;
+    private static final int MSG_RECOVER = 3;
 
     private CodecWorker mWorker;
 
@@ -54,10 +56,25 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
         public void handleMessage(Message msg) {
             switch (msg.what) {
                 case MSG_OUTPUT:
+                    long pts = (Long)msg.obj;
                     mOutputFrameCount++;
+                    mOutputFrameUs = pts;
                     break;
                 case MSG_INPUT:
                     doFrame();
+                    break;
+                case MSG_RECOVER:
+                    removeCallbacksAndMessages(null); // just in case...
+                    Log.d(LOG_TAG, "Recover: seek to " + (mOutputFrameUs / 1000));
+                    mExtractor.seekTo(mOutputFrameUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
+                    sendEmptyMessage(MSG_INPUT);
+                    mFrameView.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            Log.d(LOG_TAG, "restore bkg");
+                            mFrameView.setBackground(mFrameDrawable);
+                        }
+                    });
                     break;
                 default:
                     super.handleMessage(msg);
@@ -79,21 +96,23 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
 
         @Override
         public void onOutput(Sample sample) {
-            mWorker.sendEmptyMessage(MSG_OUTPUT);
+            Message msg = mWorker.obtainMessage(MSG_OUTPUT, new Long(sample.presentationTimeUs));
+            mWorker.sendMessage(msg);
         }
 
         @Override
         public void onError(CodecProxy.Error error) {
             switch (error) {
                 case OK:
+                    return;
+                case REMOTE_DEAD:
+                    handleRemoteDeath();
+                    mWorker.sendEmptyMessage(MSG_RECOVER);
                     break;
                 case RELEASED:
-                case REMOTE_DEAD:
-                case REMOTE_CODEC_NOT_READY:
                 case REMOTE_INPUT:
                 case REMOTE_UNKNOWN:
                     mWorker.removeCallbacksAndMessages(null);
-                    stopDecoding();
                     break;
             }
         }
@@ -105,8 +124,11 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
         GeckoAppShell.setAppContext(getApplicationContext());
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
-        SurfaceView view = (SurfaceView) findViewById(R.id.videoFrameView);
+        SurfaceView view = (SurfaceView) findViewById(R.id.videoView);
         view.getHolder().addCallback(this);
+        mFrameView = findViewById(R.id.frameView);
+        mFrameDrawable = mFrameView.getBackground();
+        mFrameDrawableDeath = new ColorDrawable(getResources().getColor(android.R.color.holo_orange_light));
     }
 
     @Override
@@ -131,6 +153,7 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
+        mWorker.removeCallbacksAndMessages(null);
         mWorker.post(new Runnable() {
             public void run() {
                 stopDecoding();
@@ -181,13 +204,29 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
         }
     }
 
+    private void handleRemoteDeath() {
+        mFrameView.post(new Runnable() {
+            @Override
+            public void run() {
+                Log.d(LOG_TAG, "set bkg");
+                mFrameView.setBackground(mFrameDrawableDeath);
+            }
+        });
+        mWorker.removeCallbacksAndMessages(null);
+    }
+
     private boolean sendFrame(Sample sample) {
-        if (mDecoder.input(sample) == CodecProxy.Error.OK) {
-            mInputFrameCount++;
-            return true;
-        } else {
-            Log.d(LOG_TAG, "send frame error");
+        CodecProxy.Error err = mDecoder.input(sample);
+        switch (err) {
+            case OK:
+                mInputFrameCount++;
+                return true;
+            case REMOTE_DEAD:
+                handleRemoteDeath();
+            default:
         }
+        Log.d(LOG_TAG, "send frame error");
+
         return false;
     }
 

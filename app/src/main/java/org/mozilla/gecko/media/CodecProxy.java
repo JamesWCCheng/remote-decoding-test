@@ -9,6 +9,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.media.MediaFormat;
+import android.os.DeadObjectException;
 import android.os.IBinder;
 import android.os.RemoteException;
 import android.util.Log;
@@ -20,11 +21,13 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /** Proxy class of ICodec binder. */
-public final class CodecProxy {
+public final class CodecProxy implements IBinder.DeathRecipient {
     private static final String LOG_TAG = CodecProxy.class.getSimpleName();
 
-    private final ICodec mRemote;
-    private boolean mReleased;
+    private ICodec mRemote;
+    private FormatParam mFormat;
+    private Surface mOutputSurface;
+    private CallbacksForwarder mCallbacks;
 
     private static final int ERROR_REMOTE_BASE = -1000;
     public enum Error {
@@ -56,8 +59,7 @@ public final class CodecProxy {
         void onError(Error error);
     }
 
-    private static class CallbacksForwarder extends ICodecCallbacks.Stub
-            implements IBinder.DeathRecipient {
+    private static class CallbacksForwarder extends ICodecCallbacks.Stub {
         private final Callbacks mCallbacks;
 
         CallbacksForwarder(Callbacks callbacks) {
@@ -83,22 +85,16 @@ public final class CodecProxy {
         public void onError(int error) throws RemoteException {
             mCallbacks.onError(Error.translateRemote(error));
         }
-
-        @Override
-        public void binderDied() {
-            Log.e(LOG_TAG, "remote codec is dead");
-            mCallbacks.onError(Error.REMOTE_DEAD);
-        }
     }
 
     private static IMediaService sCreator;
-    private static CountDownLatch sCreatorInitLatch = new CountDownLatch(1);
+    private static volatile CountDownLatch sServiceLatch;
     private static ServiceConnection sConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName name, IBinder service) {
-            Log.d(LOG_TAG, "service connected");
+            Log.d(LOG_TAG, "service connected latch:" + sServiceLatch);
             sCreator = IMediaService.Stub.asInterface(service);
-            sCreatorInitLatch.countDown();
+            sServiceLatch.countDown();
         }
 
         /**
@@ -113,65 +109,108 @@ public final class CodecProxy {
          */
         @Override
         public void onServiceDisconnected(ComponentName name) {
+            Log.d(LOG_TAG, "service disconnected");
             sCreator = null;
+            sServiceLatch.countDown();
         }
     };
+
+    @Override
+    public void binderDied() {
+        Log.e(LOG_TAG, "remote codec is dead");
+        handleRemoteDeath();
+    }
 
     public static CodecProxy create(MediaFormat format, Surface surface, Callbacks callbacks) {
         if (!ensureCreator()) {
             return null;
         }
 
-        ICodec remote = null;
-        try {
-            remote = sCreator.createCodec();
-            remote.setCallbacks(new CallbacksForwarder(callbacks));
-            remote.configure(new FormatParam(format), surface, 0);
-            remote.start();
-        } catch (RemoteException e) {
-            e.printStackTrace();
+        CodecProxy proxy = new CodecProxy(format, surface, callbacks);
+        if (proxy.init()) {
+            return proxy;
+        } else {
             return null;
         }
-
-        CodecProxy proxy = new CodecProxy(remote);
-        return proxy;
     }
 
-    private CodecProxy(ICodec remote) {
+    private CodecProxy(MediaFormat format, Surface surface, Callbacks callbacks) {
+        mFormat = new FormatParam(format);
+        mOutputSurface = surface;
+        mCallbacks = new CallbacksForwarder(callbacks);
+    }
+
+    private synchronized boolean init() {
+        ICodec remote;
+
+        try {
+            remote = sCreator.createCodec();
+            remote.setCallbacks(mCallbacks);
+            remote.configure(mFormat, mOutputSurface, 0);
+            remote.start();
+            remote.asBinder().linkToDeath(this, 0);
+        } catch (RemoteException e) {
+            e.printStackTrace();
+            return false;
+        }
+
         mRemote = remote;
+        return true;
     }
 
     private static boolean ensureCreator() {
         synchronized (sConnection) {
-            if (sCreator == null) {
-                Context appCtxt = GeckoAppShell.getApplicationContext();
-                appCtxt.bindService(new Intent(appCtxt, MediaService.class),
-                        sConnection, Context.BIND_AUTO_CREATE);
-                try {
-                    while (true) {
-                        sCreatorInitLatch.await(1, TimeUnit.SECONDS);
-                        if (sCreatorInitLatch.getCount() == 0) {
-                            break;
-                        }
-                        Log.e(LOG_TAG, "Creator not connected in 1s. Try again.");
-                    }
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-                    appCtxt.unbindService(sConnection);
-                    return false;
-                }
+            if (sCreator != null) {
+                return true;
             }
+
+            Context appCtxt = GeckoAppShell.getApplicationContext();
+            appCtxt.bindService(new Intent(appCtxt, MediaService.class),
+                    sConnection, Context.BIND_AUTO_CREATE);
+            try {
+                sServiceLatch = new CountDownLatch(1);
+                while (true) {
+                    Log.d(LOG_TAG, "waiting for creator... latch:" + sServiceLatch);
+                    sServiceLatch.await(1, TimeUnit.SECONDS);
+                    if (sServiceLatch.getCount() == 0) {
+                        break;
+                    }
+                    Log.e(LOG_TAG, "Creator not connected in 1s. Try again.");
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                appCtxt.unbindService(sConnection);
+                return false;
+            }
+
             return true;
         }
     }
 
+    private synchronized void handleRemoteDeath() {
+        sServiceLatch = new CountDownLatch(1);
+        try {
+            sServiceLatch.await();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+
+        ensureCreator();
+
+        init();
+
+        mCallbacks.mCallbacks.onError(Error.REMOTE_DEAD);
+    }
+
     public synchronized Error input(Sample sample) {
-        if (mReleased) {
+        if (mRemote == null) {
             Log.e(LOG_TAG, "cannot send input to an ended codec");
             return Error.RELEASED;
         }
         try {
             mRemote.inputSample(sample);
+        } catch (DeadObjectException e) {
+            return Error.REMOTE_DEAD;
         } catch (RemoteException e) {
             e.printStackTrace();
             Log.e(LOG_TAG, "fail to input sample:" + sample);
@@ -181,12 +220,14 @@ public final class CodecProxy {
     }
 
     public synchronized Error flush() {
-        if (mReleased) {
+        if (mRemote == null) {
             Log.e(LOG_TAG, "cannot flush an ended codec");
             return Error.RELEASED;
         }
         try {
             mRemote.flush();
+        } catch (DeadObjectException e) {
+            return Error.REMOTE_DEAD;
         } catch (RemoteException e) {
             e.printStackTrace();
             return Error.REMOTE_UNKNOWN;
@@ -195,14 +236,17 @@ public final class CodecProxy {
     }
 
     public synchronized Error release() {
-        if (mReleased) {
+        if (mRemote == null) {
             Log.d(LOG_TAG, "codec already ended");
             return Error.OK;
         }
         try {
             mRemote.stop();
             mRemote.release();
-            mReleased = true;
+            mRemote.asBinder().unlinkToDeath(this, 0);
+            mRemote = null;
+        } catch (DeadObjectException e) {
+            return Error.REMOTE_DEAD;
         } catch (RemoteException e) {
             e.printStackTrace();
             return Error.REMOTE_UNKNOWN;

@@ -275,6 +275,11 @@ public final class MediaService extends Service {
 
                 @Override
                 public void onOutputBufferAvailable(@NonNull MediaCodec codec, int index, @NonNull MediaCodec.BufferInfo info) {
+                    try {
+                        mCallbacks.onOutput(new Sample(null, info.presentationTimeUs, info.flags));
+                    } catch (RemoteException e) {
+                        e.printStackTrace();
+                    }
                     /*
                     StringBuffer str = new StringBuffer();
                     str.append("available output buffer#").append(index).append("=").
