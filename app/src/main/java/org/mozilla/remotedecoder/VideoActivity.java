@@ -22,6 +22,7 @@ import android.view.View;
 import org.mozilla.gecko.GeckoAppShell;
 import org.mozilla.gecko.media.CodecProxy;
 import org.mozilla.gecko.media.Sample;
+import org.mozilla.remotedecoder.GeckoHlsPlayer;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -49,6 +50,8 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
     private static final int MSG_RECOVER = 3;
 
     private CodecWorker mWorker;
+
+    private GeckoHlsPlayer geckoHlsPlayer;
 
     class CodecWorker extends Handler {
         public CodecWorker(Looper looper) { super(looper); }
@@ -129,6 +132,8 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
         mFrameView = findViewById(R.id.frameView);
         mFrameDrawable = mFrameView.getBackground();
         mFrameDrawableDeath = new ColorDrawable(getResources().getColor(android.R.color.holo_orange_light));
+
+        geckoHlsPlayer = new GeckoHlsPlayer(this, getIntent());
     }
 
     @Override
