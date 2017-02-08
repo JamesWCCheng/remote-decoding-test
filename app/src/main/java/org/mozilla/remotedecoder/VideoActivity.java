@@ -19,6 +19,11 @@ import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 
+import com.google.android.exoplayer2.C;
+import com.google.android.exoplayer2.ExoPlayer;
+import com.google.android.exoplayer2.Renderer;
+import com.google.android.exoplayer2.ui.SimpleExoPlayerView;
+
 import org.mozilla.gecko.GeckoAppShell;
 import org.mozilla.gecko.media.CodecProxy;
 import org.mozilla.gecko.media.Sample;
@@ -139,6 +144,7 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         mHolder = holder;
+        geckoHlsPlayer.setSurface(mHolder.getSurface());
     }
 
     @Override
@@ -151,7 +157,7 @@ public class VideoActivity extends AppCompatActivity implements SurfaceHolder.Ca
 
         mWorker.post(new Runnable() {
             public void run() {
-                startDecoding();
+//                startDecoding();
             }
         });
     }
