@@ -7,12 +7,10 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.view.Surface;
 import com.google.android.exoplayer2.C;
-import com.google.android.exoplayer2.DefaultLoadControl;
 import com.google.android.exoplayer2.ExoPlaybackException;
 import com.google.android.exoplayer2.ExoPlayer;
 import com.google.android.exoplayer2.ExoPlayerFactory;
 import com.google.android.exoplayer2.Renderer;
-import com.google.android.exoplayer2.SimpleExoPlayer;
 import com.google.android.exoplayer2.Timeline;
 import com.google.android.exoplayer2.source.MediaSource;
 import com.google.android.exoplayer2.source.TrackGroupArray;
@@ -21,7 +19,6 @@ import com.google.android.exoplayer2.trackselection.AdaptiveVideoTrackSelection;
 import com.google.android.exoplayer2.trackselection.DefaultTrackSelector;
 import com.google.android.exoplayer2.trackselection.TrackSelection;
 import com.google.android.exoplayer2.trackselection.TrackSelectionArray;
-import com.google.android.exoplayer2.ui.SimpleExoPlayerView;
 import com.google.android.exoplayer2.upstream.DataSource;
 import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter;
 import com.google.android.exoplayer2.upstream.DefaultDataSourceFactory;
@@ -46,14 +43,11 @@ public class GeckoHlsPlayer implements ExoPlayer.EventListener {
     private EventLogger eventLogger;
 
     private ExoPlayer player;
-//    private SimpleExoPlayer player;
 
     private DefaultTrackSelector trackSelector;
     private boolean isTimelineStatic = false;
     private final Renderer[] renderers;
     private MediaSource mediaSource;
-
-    private SimpleExoPlayerView simpleExoPlayerView;
 
     public DataSource.Factory buildDataSourceFactory(VideoActivity va, DefaultBandwidthMeter bandwidthMeter) {
         return new DefaultDataSourceFactory(va, bandwidthMeter,
@@ -106,11 +100,6 @@ public class GeckoHlsPlayer implements ExoPlayer.EventListener {
     }
 
     public GeckoHlsPlayer(VideoActivity va, Intent intent) {
-
-//        simpleExoPlayerView = (SimpleExoPlayerView) va.findViewById(R.id.player_view);
-//        simpleExoPlayerView.setControllerVisibilityListener(va);
-//        simpleExoPlayerView.requestFocus();
-
         window = new Timeline.Window();
         TrackSelection.Factory videoTrackSelectionFactory =
                 new AdaptiveVideoTrackSelection.Factory(BANDWIDTH_METER);
@@ -118,11 +107,10 @@ public class GeckoHlsPlayer implements ExoPlayer.EventListener {
 
         ArrayList<Renderer> renderersList = new ArrayList<>();
         renderersList.add(new GeckoHlsVideoRender(va, MediaCodecSelector.DEFAULT));
-        renderersList.add(new GeckoHlsAudioRender(MediaCodecSelector.DEFAULT));
+//        renderersList.add(new GeckoHlsAudioRender(MediaCodecSelector.DEFAULT));
         renderers = renderersList.toArray(new Renderer[renderersList.size()]);
 
         player = ExoPlayerFactory.newInstance(renderers, trackSelector);
-//        player = ExoPlayerFactory.newSimpleInstance(va, trackSelector, new DefaultLoadControl());
         player.addListener(this);
 
         eventLogger = new EventLogger(trackSelector);
@@ -140,10 +128,6 @@ public class GeckoHlsPlayer implements ExoPlayer.EventListener {
         MediaSource[] mediaSources = new MediaSource[1];
         mediaSources[0] = buildMediaSource(uris[0], extensions[0]);
         mediaSource = mediaSources[0];
-//        player.prepare(mediaSource);
-
-//        simpleExoPlayerView.setPlayer(player);
-
     }
 
     @Override
