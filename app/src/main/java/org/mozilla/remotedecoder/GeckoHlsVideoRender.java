@@ -3,9 +3,7 @@ package org.mozilla.remotedecoder;
 import android.annotation.TargetApi;
 import android.content.Context;
 import android.media.MediaCodec;
-import android.media.MediaCrypto;
 import android.media.MediaFormat;
-import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -17,8 +15,6 @@ import com.google.android.exoplayer2.FormatHolder;
 import com.google.android.exoplayer2.decoder.DecoderCounters;
 import com.google.android.exoplayer2.decoder.DecoderInputBuffer;
 import com.google.android.exoplayer2.drm.DrmInitData;
-import com.google.android.exoplayer2.drm.DrmSessionManager;
-import com.google.android.exoplayer2.drm.FrameworkMediaCrypto;
 import com.google.android.exoplayer2.mediacodec.MediaCodecInfo;
 import com.google.android.exoplayer2.mediacodec.MediaCodecSelector;
 import com.google.android.exoplayer2.mediacodec.MediaCodecRenderer;
@@ -26,9 +22,9 @@ import com.google.android.exoplayer2.mediacodec.MediaCodecUtil;
 import com.google.android.exoplayer2.util.Assertions;
 import com.google.android.exoplayer2.util.MimeTypes;
 import com.google.android.exoplayer2.util.NalUnitUtil;
+import com.google.android.exoplayer2.util.ParsableBitArray;
 import com.google.android.exoplayer2.util.TraceUtil;
 import com.google.android.exoplayer2.util.Util;
-import com.google.android.exoplayer2.video.MediaCodecVideoRenderer;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -43,22 +39,13 @@ import java.util.List;
 public class GeckoHlsVideoRender extends BaseRenderer {
     private static final String TAG = "GeckoHlsVideoRender";
 
-    private static final long MAX_CODEC_HOTSWAP_TIME_MS = 1000L;
-    private static final int RECONFIGURATION_STATE_NONE = 0;
-    private static final int RECONFIGURATION_STATE_WRITE_PENDING = 1;
-    private static final int RECONFIGURATION_STATE_QUEUE_PENDING = 2;
-    private static final int REINITIALIZATION_STATE_NONE = 0;
-    private static final int REINITIALIZATION_STATE_SIGNAL_END_OF_STREAM = 1;
-    private static final int REINITIALIZATION_STATE_WAIT_END_OF_STREAM = 2;
     private static final byte[] ADAPTATION_WORKAROUND_BUFFER = Util.getBytesFromHexString("0000016742C00BDA259000000168CE0F13200000016588840DCE7118A0002FBF1C31C3275D78");
     private static final int ADAPTATION_WORKAROUND_SLICE_WIDTH_HEIGHT = 32;
     private final MediaCodecSelector mediaCodecSelector;
     private final DecoderInputBuffer buffer;
     private final FormatHolder formatHolder;
     private final List<Long> decodeOnlyPresentationTimestamps;
-    private final MediaCodec.BufferInfo outputBufferInfo;
     private Format format;
-    private MediaCodec codec;
 
     private boolean codecIsAdaptive;
     private boolean codecNeedsDiscardToSpsWorkaround;
@@ -66,9 +53,10 @@ public class GeckoHlsVideoRender extends BaseRenderer {
     private boolean codecNeedsAdaptationWorkaround;
     private boolean codecNeedsEosPropagationWorkaround;
     private boolean codecNeedsEosFlushWorkaround;
-    private boolean codecNeedsMonoChannelCountWorkaround;
     private boolean codecNeedsAdaptationWorkaroundBuffer;
     private boolean shouldSkipAdaptationWorkaroundOutputBuffer;
+
+    private boolean initialized = false;
     private ByteBuffer[] inputBuffers;
     private ByteBuffer[] outputBuffers;
     private boolean[] inputBufferUsable;
@@ -84,15 +72,10 @@ public class GeckoHlsVideoRender extends BaseRenderer {
     private boolean codecReceivedEos;
     private boolean inputStreamEnded;
     private boolean outputStreamEnded;
-    private boolean waitingForKeys;
     protected DecoderCounters decoderCounters;
 
     private Format[] streamFormats;
     private GeckoHlsVideoRender.CodecMaxValues codecMaxValues;
-
-//    public GeckoHlsVideoRender(Context context, MediaCodecSelector mediaCodecSelector) {
-//        super(C.TRACK_TYPE_VIDEO, mediaCodecSelector, null, false);
-//    }
 
     public int getAvailableInputBufferIndex() {
         for (int i = 0; i < inputBufferUsable.length; i++) {
@@ -124,7 +107,6 @@ public class GeckoHlsVideoRender extends BaseRenderer {
         this.buffer = new DecoderInputBuffer(0);
         this.formatHolder = new FormatHolder();
         this.decodeOnlyPresentationTimestamps = new ArrayList();
-        this.outputBufferInfo = new MediaCodec.BufferInfo();
         this.codecReconfigurationState = 0;
         this.codecReinitializationState = 0;
 
@@ -153,13 +135,6 @@ public class GeckoHlsVideoRender extends BaseRenderer {
     protected void onStreamChanged(Format[] formats) throws ExoPlaybackException {
         this.streamFormats = formats;
         super.onStreamChanged(formats);
-    }
-
-//    @Override
-    protected void configureCodec(MediaCodec codec, Format format, MediaCrypto crypto) {
-        codecMaxValues = getCodecMaxValues(format, streamFormats);
-        MediaFormat mediaFormat = getMediaFormat(format, codecMaxValues, false);
-        codec.configure(mediaFormat, null, crypto, 0);
     }
 
     private static int getMaxInputSize(Format format) {
@@ -249,34 +224,23 @@ public class GeckoHlsVideoRender extends BaseRenderer {
     public ByteBuffer[] getInputBuffers() {
         ByteBuffer[] temp = new ByteBuffer[4];
         for (int i = 0; i < temp.length; i++) {
-            byte[] bytes = new byte[1024000];
+            byte[] bytes = new byte[codecMaxValues.inputSize];
             temp[i] = ByteBuffer.wrap(bytes);
         }
         return temp;
     }
 
-    protected final void maybeInitCodec() throws ExoPlaybackException {
+    protected final void maybeInitRenderer() throws ExoPlaybackException {
         if(this.shouldInitCodec()) {
-            String mimeType = this.format.sampleMimeType;
-            MediaCrypto mediaCrypto = null;
-            boolean drmSessionRequiresSecureDecoder = false;
-
             MediaCodecInfo decoderInfo1 = null;
-
             try {
-                decoderInfo1 = this.getDecoderInfo(this.mediaCodecSelector, this.format, drmSessionRequiresSecureDecoder);
-                if(decoderInfo1 == null && drmSessionRequiresSecureDecoder) {
-                    decoderInfo1 = this.getDecoderInfo(this.mediaCodecSelector, this.format, false);
-                    if(decoderInfo1 != null) {
-                        Log.w("MediaCodecRenderer", "Drm session requires secure decoder for " + mimeType + ", but " + "no secure decoder available. Trying to proceed with " + decoderInfo1.name + ".");
-                    }
-                }
+                decoderInfo1 = this.getDecoderInfo(this.mediaCodecSelector, this.format, false);
             } catch (MediaCodecUtil.DecoderQueryException var11) {
-                this.throwDecoderInitError(new MediaCodecRenderer.DecoderInitializationException(this.format, var11, drmSessionRequiresSecureDecoder, -49998));
+                this.throwDecoderInitError(new MediaCodecRenderer.DecoderInitializationException(this.format, var11, false, -49998));
             }
 
             if(decoderInfo1 == null) {
-                this.throwDecoderInitError(new MediaCodecRenderer.DecoderInitializationException(this.format, (Throwable)null, drmSessionRequiresSecureDecoder, -49999));
+                this.throwDecoderInitError(new MediaCodecRenderer.DecoderInitializationException(this.format, (Throwable)null, false, -49999));
             }
 
             String codecName = decoderInfo1.name;
@@ -286,25 +250,17 @@ public class GeckoHlsVideoRender extends BaseRenderer {
             this.codecNeedsAdaptationWorkaround = codecNeedsAdaptationWorkaround(codecName);
             this.codecNeedsEosPropagationWorkaround = codecNeedsEosPropagationWorkaround(codecName);
             this.codecNeedsEosFlushWorkaround = codecNeedsEosFlushWorkaround(codecName);
-            this.codecNeedsMonoChannelCountWorkaround = codecNeedsMonoChannelCountWorkaround(codecName, this.format);
 
             try {
                 long e = SystemClock.elapsedRealtime();
-                TraceUtil.beginSection("createCodec:" + codecName);
-                this.codec = MediaCodec.createByCodecName(codecName);
+                TraceUtil.beginSection("initRenderer:" + codecName);
+                codecMaxValues = getCodecMaxValues(this.format, this.streamFormats);
+                this.initialized = true;
+                this.inputBuffers = getInputBuffers();
+                this.outputBuffers = getInputBuffers();
                 TraceUtil.endSection();
-                TraceUtil.beginSection("configureCodec");
-                this.configureCodec(this.codec, this.format, mediaCrypto);
-                TraceUtil.endSection();
-                TraceUtil.beginSection("startCodec");
-                this.codec.start();
-                TraceUtil.endSection();
-                long codecInitializedTimestamp = SystemClock.elapsedRealtime();
-                this.onCodecInitialized(codecName, codecInitializedTimestamp, codecInitializedTimestamp - e);
-                this.inputBuffers = getInputBuffers(); //this.codec.getInputBuffers();
-                this.outputBuffers = getInputBuffers();//this.codec.getOutputBuffers();
             } catch (Exception var10) {
-                this.throwDecoderInitError(new MediaCodecRenderer.DecoderInitializationException(this.format, var10, drmSessionRequiresSecureDecoder, codecName));
+                this.throwDecoderInitError(new MediaCodecRenderer.DecoderInitializationException(this.format, var10, false, codecName));
             }
 
             this.codecHotswapDeadlineMs = this.getState() == 2?SystemClock.elapsedRealtime() + 1000L:-9223372036854775807L;
@@ -319,34 +275,32 @@ public class GeckoHlsVideoRender extends BaseRenderer {
     }
 
     protected boolean shouldInitCodec() {
-        return this.codec == null && this.format != null;
+        return !this.initialized && this.format != null;
     }
 
     protected void onPositionReset(long positionUs, boolean joining) throws ExoPlaybackException {
         this.inputStreamEnded = false;
         this.outputStreamEnded = false;
-        if(this.codec != null) {
-            this.flushCodec();
+        if (this.initialized) {
+            this.flushRenderer();
         }
-
     }
 
     protected void onDisabled() {
         this.format = null;
 
         try {
-            this.releaseCodec();
+            this.releaseRenderer();
         } finally {
         }
 
     }
 
-    protected void releaseCodec() {
-        if(this.codec != null) {
+    protected void releaseRenderer() {
+        if (this.initialized) {
             this.codecHotswapDeadlineMs = -9223372036854775807L;
             this.inputIndex = -1;
             this.outputIndex = -1;
-            this.waitingForKeys = false;
             this.decodeOnlyPresentationTimestamps.clear();
             this.inputBuffers = null;
             this.outputBuffers = null;
@@ -358,7 +312,6 @@ public class GeckoHlsVideoRender extends BaseRenderer {
             this.codecNeedsAdaptationWorkaround = false;
             this.codecNeedsEosPropagationWorkaround = false;
             this.codecNeedsEosFlushWorkaround = false;
-            this.codecNeedsMonoChannelCountWorkaround = false;
             this.codecNeedsAdaptationWorkaroundBuffer = false;
             this.shouldSkipAdaptationWorkaroundOutputBuffer = false;
             this.codecReceivedEos = false;
@@ -366,15 +319,7 @@ public class GeckoHlsVideoRender extends BaseRenderer {
             this.codecReinitializationState = 0;
             ++this.decoderCounters.decoderReleaseCount;
 
-            try {
-                this.codec.stop();
-            } finally {
-                try {
-                    this.codec.release();
-                } finally {
-                    this.codec = null;
-                }
-            }
+            this.initialized = false;
         }
 
     }
@@ -397,8 +342,8 @@ public class GeckoHlsVideoRender extends BaseRenderer {
                 this.readFormat();
             }
 
-            this.maybeInitCodec();
-            if(this.codec != null) {
+            this.maybeInitRenderer();
+            if(this.initialized) {
                 TraceUtil.beginSection("drainAndFeed");
                 while (drainOutputBuffer(positionUs, elapsedRealtimeUs)) {}
                 while (feedInputBuffer()) {}
@@ -413,28 +358,26 @@ public class GeckoHlsVideoRender extends BaseRenderer {
 
     private void readFormat() throws ExoPlaybackException {
         int result = this.readSource(this.formatHolder, (DecoderInputBuffer)null);
-        if(result == -5) {
+        if (result == -5) {
             this.onInputFormatChanged(this.formatHolder.format);
         }
 
     }
 
-    protected void flushCodec() throws ExoPlaybackException {
+    protected void flushRenderer() throws ExoPlaybackException {
         this.codecHotswapDeadlineMs = -9223372036854775807L;
         this.inputIndex = -1;
         this.outputIndex = -1;
-        this.waitingForKeys = false;
         this.decodeOnlyPresentationTimestamps.clear();
         this.codecNeedsAdaptationWorkaroundBuffer = false;
         this.shouldSkipAdaptationWorkaroundOutputBuffer = false;
         if(this.codecNeedsFlushWorkaround || this.codecNeedsEosFlushWorkaround && this.codecReceivedEos) {
-            this.releaseCodec();
-            this.maybeInitCodec();
+            this.releaseRenderer();
+            this.maybeInitRenderer();
         } else if(this.codecReinitializationState != 0) {
-            this.releaseCodec();
-            this.maybeInitCodec();
+            this.releaseRenderer();
+            this.maybeInitRenderer();
         } else {
-            this.codec.flush();
             this.codecReceivedBuffers = false;
         }
 
@@ -456,7 +399,7 @@ public class GeckoHlsVideoRender extends BaseRenderer {
 //        int adaptiveReconfigurationBytes = this.buffer.data.position();
         int result = this.readSource(this.formatHolder, this.buffer);
 
-        if(this.codec != null && this.codecReinitializationState != 2 && !this.inputStreamEnded) {
+        if(this.initialized && this.codecReinitializationState != 2 && !this.inputStreamEnded) {
             if(this.codecReconfigurationState == 1) {
                 for(int bufferEncrypted = 0; bufferEncrypted < this.format.initializationData.size(); ++bufferEncrypted) {
                     byte[] e = (byte[])this.format.initializationData.get(bufferEncrypted);
@@ -489,7 +432,6 @@ public class GeckoHlsVideoRender extends BaseRenderer {
                     try {
                         if(!this.codecNeedsEosPropagationWorkaround) {
                             this.codecReceivedEos = true;
-//                            this.codec.queueInputBuffer(this.inputIndex, 0, 0, 0L, 4);
                             this.inputIndex = -1;
                         }
 
@@ -516,7 +458,6 @@ public class GeckoHlsVideoRender extends BaseRenderer {
                     this.buffer.flip();
                     this.onQueueInputBuffer(this.buffer);
                     markInputBufferUsed(this.inputIndex);
-//                        this.codec.queueInputBuffer(this.inputIndex, 0, this.buffer.data.limit(), var10, 0);
 
                     this.inputIndex = -1;
                     this.codecReceivedBuffers = true;
@@ -532,19 +473,9 @@ public class GeckoHlsVideoRender extends BaseRenderer {
         }
     }
 
-    protected void onCodecInitialized(String name, long initializedTimestampMs, long initializationDurationMs) {
-    }
-
     protected void onInputFormatChanged(Format newFormat) throws ExoPlaybackException {
         Format oldFormat = this.format;
         this.format = newFormat;
-        boolean drmInitDataChanged = !Util.areEqual(this.format.drmInitData, oldFormat == null?null:oldFormat.drmInitData);
-        if(drmInitDataChanged) {
-            if(this.format.drmInitData != null) {
-                throw ExoPlaybackException.createForRenderer(new IllegalStateException("Media requires a DrmSessionManager"), this.getIndex());
-            } else {
-            }
-        }
 
         if(false) {
             this.codecReconfigured = true;
@@ -553,13 +484,10 @@ public class GeckoHlsVideoRender extends BaseRenderer {
         } else if(this.codecReceivedBuffers) {
             this.codecReinitializationState = 1;
         } else {
-            this.releaseCodec();
-            this.maybeInitCodec();
+            this.releaseRenderer();
+            this.maybeInitRenderer();
         }
 
-    }
-
-    protected void onOutputFormatChanged(MediaCodec codec, MediaFormat outputFormat) {
     }
 
     protected void onOutputStreamEnded() {
@@ -573,7 +501,7 @@ public class GeckoHlsVideoRender extends BaseRenderer {
     }
 
     public boolean isReady() {
-        return this.format != null && !this.waitingForKeys && (this.isSourceReady() || this.outputIndex >= 0 || this.codecHotswapDeadlineMs != -9223372036854775807L && SystemClock.elapsedRealtime() < this.codecHotswapDeadlineMs);
+        return this.format != null && (this.isSourceReady() || this.outputIndex >= 0 || this.codecHotswapDeadlineMs != -9223372036854775807L && SystemClock.elapsedRealtime() < this.codecHotswapDeadlineMs);
     }
 
     private boolean drainOutputBuffer(long positionUs, long elapsedRealtimeUs) throws ExoPlaybackException {
@@ -591,8 +519,8 @@ public class GeckoHlsVideoRender extends BaseRenderer {
 
     private void processEndOfStream() throws ExoPlaybackException {
         if(this.codecReinitializationState == 2) {
-            this.releaseCodec();
-            this.maybeInitCodec();
+            this.releaseRenderer();
+            this.maybeInitRenderer();
         } else {
             this.outputStreamEnded = true;
             this.onOutputStreamEnded();
@@ -618,10 +546,6 @@ public class GeckoHlsVideoRender extends BaseRenderer {
 
     private static boolean codecNeedsEosFlushWorkaround(String name) {
         return Util.SDK_INT <= 23 && "OMX.google.vorbis.decoder".equals(name) || Util.SDK_INT <= 19 && "hb2000".equals(Util.DEVICE) && ("OMX.amlogic.avc.decoder.awesome".equals(name) || "OMX.amlogic.avc.decoder.awesome.secure".equals(name));
-    }
-
-    private static boolean codecNeedsMonoChannelCountWorkaround(String name, Format format) {
-        return Util.SDK_INT <= 18 && format.channelCount == 1 && "OMX.MTK.AUDIO.DECODER.MP3".equals(name);
     }
 
     public static class DecoderInitializationException extends Exception {
@@ -658,23 +582,6 @@ public class GeckoHlsVideoRender extends BaseRenderer {
             String sign = errorCode < 0?"neg_":"";
             return "com.google.android.exoplayer.MediaCodecTrackRenderer_" + sign + Math.abs(errorCode);
         }
-    }
-
-    private static MediaFormat getMediaFormat(Format format, GeckoHlsVideoRender.CodecMaxValues codecMaxValues,
-                                              boolean deviceNeedsAutoFrcWorkaround) {
-        MediaFormat frameworkMediaFormat = format.getFrameworkMediaFormatV16();
-        // Set the maximum adaptive video dimensions.
-        frameworkMediaFormat.setInteger(MediaFormat.KEY_MAX_WIDTH, codecMaxValues.width);
-        frameworkMediaFormat.setInteger(MediaFormat.KEY_MAX_HEIGHT, codecMaxValues.height);
-        // Set the maximum input size.
-        if (codecMaxValues.inputSize != Format.NO_VALUE) {
-            frameworkMediaFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, codecMaxValues.inputSize);
-        }
-        // Set FRC workaround.
-        if (deviceNeedsAutoFrcWorkaround) {
-            frameworkMediaFormat.setInteger("auto-frc", 0);
-        }
-        return frameworkMediaFormat;
     }
 
     protected int supportsFormat(MediaCodecSelector mediaCodecSelector, Format format)
