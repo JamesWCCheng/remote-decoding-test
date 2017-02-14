@@ -107,7 +107,7 @@ public class GeckoHlsPlayer implements ExoPlayer.EventListener {
 
         ArrayList<Renderer> renderersList = new ArrayList<>();
         renderersList.add(new GeckoHlsVideoRender(va, MediaCodecSelector.DEFAULT));
-//        renderersList.add(new GeckoHlsAudioRender(MediaCodecSelector.DEFAULT));
+        //renderersList.add(new GeckoHlsAudioRender(MediaCodecSelector.DEFAULT));
         renderers = renderersList.toArray(new Renderer[renderersList.size()]);
 
         player = ExoPlayerFactory.newInstance(renderers, trackSelector);
